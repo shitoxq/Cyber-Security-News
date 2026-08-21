@@ -77,7 +77,7 @@ def build_telegram_message(alert: SecurityAlertSchema, source: str, link: str = 
     severity_emojis = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}
     emoji = severity_emojis.get(alert.severity.upper(), "🟡")
     
-    # Clean up hashtags and sanitize all dynamic values for HTML safety
+    # Clean up hashtags and sanitize dynamic values for HTML safety
     tags = " ".join([t if t.startswith("#") else f"#{t}" for t in alert.hashtags])
     title = html.escape(alert.title)
     summary = html.escape(alert.summary)
@@ -115,12 +115,25 @@ def send_telegram_alert(text: str):
 def run():
     init_db()
     
-    feed_url = "https://www.cisa.gov/cybersecurity-advisories/all.xml"
-    feed = feedparser.parse(feed_url)
+    # Custom headers prevent government RSS feeds from blocking feedparser
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    primary_url = "https://www.cisa.gov/cybersecurity-advisories/all.xml"
+    feed = feedparser.parse(primary_url, request_headers=headers)
+
+    # Fallback endpoint if primary fails
+    if not feed.entries:
+        print("Primary feed empty or blocked. Trying fallback CISA feed...")
+        fallback_url = "https://www.cisa.gov/news-events/cybersecurity-advisories/rss.xml"
+        feed = feedparser.parse(fallback_url, request_headers=headers)
 
     if not feed.entries:
-        print("No feed entries found.")
+        print("No feed entries found across all sources.")
         return
+
+    print(f"Successfully fetched {len(feed.entries)} feed entries.")
 
     new_alerts_count = 0
     # Process newest entries (up to 5)
@@ -138,24 +151,28 @@ def run():
         print(f"New alert detected: {guid}")
         raw_content = f"Title: {entry.title}\nContent: {entry.get('summary', '')}"
 
-        # 1. Summarize with Gemini
-        parsed_alert = analyze_threat_with_gemini(raw_content)
+        try:
+            # 1. Summarize with Gemini
+            parsed_alert = analyze_threat_with_gemini(raw_content)
 
-        # 2. Format message (with HTML escaping and hyperlink)
-        telegram_msg = build_telegram_message(
-            parsed_alert, 
-            source="CISA Advisories", 
-            link=article_link
-        )
+            # 2. Format message
+            telegram_msg = build_telegram_message(
+                parsed_alert, 
+                source="CISA Advisories", 
+                link=article_link
+            )
 
-        # 3. Send to Telegram
-        send_telegram_alert(telegram_msg)
+            # 3. Send to Telegram
+            send_telegram_alert(telegram_msg)
 
-        # 4. Save GUID to SQLite to prevent duplicates
-        mark_alert_processed(guid)
-        
-        new_alerts_count += 1
-        print(f"Successfully processed and sent alert: {guid}")
+            # 4. Save GUID to SQLite to prevent duplicates
+            mark_alert_processed(guid)
+            
+            new_alerts_count += 1
+            print(f"Successfully processed and sent alert: {guid}")
+
+        except Exception as e:
+            print(f"Error processing alert {guid}: {e}")
 
     if new_alerts_count == 0:
         print("No new alerts to post.")
