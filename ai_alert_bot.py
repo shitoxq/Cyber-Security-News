@@ -84,7 +84,7 @@ def build_telegram_message(alert: SecurityAlertSchema, source: str, link: str = 
     action = html.escape(alert.recommended_action)
 
     # Attach URL hyperlink if provided
-    source_str = f'<a href="{link}">{source}</a>' if link else source
+    source_str = f'<a href="{link}">{html.escape(source)}</a>' if link else html.escape(source)
 
     return (
         f"🚨 <b>CYBERSECURITY ALERT</b>\n\n"
@@ -106,7 +106,7 @@ def send_telegram_alert(text: str):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    res = requests.post(url, json=payload)
+    res = requests.post(url, json=payload, timeout=10)
     res.raise_for_status()
 
 # ---------------------------------------------------------------------------
@@ -115,67 +115,78 @@ def send_telegram_alert(text: str):
 def run():
     init_db()
     
-    # Custom headers prevent government RSS feeds from blocking feedparser
+    # Expanded Multi-Feed List including Palo Alto Networks Unit 42 & Advisories
+    SOURCES = [
+        {"name": "Palo Alto Unit 42", "url": "https://unit42.paloaltonetworks.com/feed/"},
+        {"name": "Palo Alto Advisories", "url": "https://security.paloaltonetworks.com/rss.xml"},
+        {"name": "CISA Advisories", "url": "https://www.cisa.gov/cybersecurity-advisories/all.xml"},
+        {"name": "The Hacker News", "url": "https://feeds.feedburner.com/TheHackersNews"},
+        {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/"},
+        {"name": "Dark Reading", "url": "https://www.darkreading.com/rss.xml"},
+        {"name": "SecurityWeek", "url": "https://www.securityweek.com/feed/"},
+        {"name": "Sophos Research", "url": "https://news.sophos.com/en-us/category/threat-research/feed/"},
+        {"name": "Krebs on Security", "url": "https://krebsonsecurity.com/feed/"},
+        {"name": "SANS ISC", "url": "https://isc.sans.edu/rssfeed_full.xml"},
+        {"name": "WeLiveSecurity", "url": "https://www.welivesecurity.com/en/rss/feed/"}
+    ]
+
+    # Browser headers required to bypass Cloudflare/WAF bot blocks
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
-    
-    primary_url = "https://www.cisa.gov/cybersecurity-advisories/all.xml"
-    feed = feedparser.parse(primary_url, request_headers=headers)
 
-    # Fallback endpoint if primary fails
-    if not feed.entries:
-        print("Primary feed empty or blocked. Trying fallback CISA feed...")
-        fallback_url = "https://www.cisa.gov/news-events/cybersecurity-advisories/rss.xml"
-        feed = feedparser.parse(fallback_url, request_headers=headers)
+    total_new_alerts = 0
 
-    if not feed.entries:
-        print("No feed entries found across all sources.")
-        return
-
-    print(f"Successfully fetched {len(feed.entries)} feed entries.")
-
-    new_alerts_count = 0
-    # Process newest entries (up to 5)
-    for entry in reversed(feed.entries[:5]):
-        guid = entry.get("id", entry.get("link"))
-        article_link = entry.get("link")
-        
-        if not guid:
-            continue
-
-        if is_alert_processed(guid):
-            print(f"Skipping already processed alert: {guid}")
-            continue
-
-        print(f"New alert detected: {guid}")
-        raw_content = f"Title: {entry.title}\nContent: {entry.get('summary', '')}"
-
+    for source in SOURCES:
         try:
-            # 1. Summarize with Gemini
-            parsed_alert = analyze_threat_with_gemini(raw_content)
-
-            # 2. Format message
-            telegram_msg = build_telegram_message(
-                parsed_alert, 
-                source="CISA Advisories", 
-                link=article_link
-            )
-
-            # 3. Send to Telegram
-            send_telegram_alert(telegram_msg)
-
-            # 4. Save GUID to SQLite to prevent duplicates
-            mark_alert_processed(guid)
+            print(f"Fetching feed: {source['name']}...")
+            response = requests.get(source["url"], headers=headers, timeout=10)
+            response.raise_for_status()
             
-            new_alerts_count += 1
-            print(f"Successfully processed and sent alert: {guid}")
+            feed = feedparser.parse(response.content)
+            if not feed.entries:
+                print(f"No entries found for {source['name']}")
+                continue
+
+            # Check the newest 2 entries per source
+            for entry in reversed(feed.entries[:2]):
+                guid = entry.get("id", entry.get("link"))
+                article_link = entry.get("link")
+
+                if not guid or is_alert_processed(guid):
+                    continue
+
+                print(f"[{source['name']}] New threat detected: {guid}")
+                raw_content = f"Title: {entry.title}\nContent: {entry.get('summary', '')}"
+
+                try:
+                    # 1. Gemini Summarization
+                    parsed_alert = analyze_threat_with_gemini(raw_content)
+
+                    # 2. Format Telegram message
+                    telegram_msg = build_telegram_message(
+                        alert=parsed_alert, 
+                        source=source["name"], 
+                        link=article_link
+                    )
+
+                    # 3. Send Alert to Telegram
+                    send_telegram_alert(telegram_msg)
+
+                    # 4. Save to SQLite DB
+                    mark_alert_processed(guid)
+                    
+                    total_new_alerts += 1
+                    print(f"[{source['name']}] Sent alert successfully.")
+
+                except Exception as e:
+                    print(f"Failed processing item from {source['name']}: {e}")
 
         except Exception as e:
-            print(f"Error processing alert {guid}: {e}")
+            print(f"Could not reach {source['name']}: {e}")
 
-    if new_alerts_count == 0:
-        print("No new alerts to post.")
+    print(f"Execution complete. Total new alerts posted: {total_new_alerts}")
 
 if __name__ == "__main__":
     run()
