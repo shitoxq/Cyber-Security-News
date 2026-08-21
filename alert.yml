@@ -1,0 +1,51 @@
+name: Cybersecurity Alert Bot
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Runs automatically every hour
+  workflow_dispatch:      # Allows manual trigger from GitHub UI
+
+jobs:
+  run-alert-bot:
+    runs-on: ubuntu-latest
+    
+    # Required permissions to commit changes back to the repository
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests feedparser google-genai pydantic
+
+      - name: Run Alert Script
+        run: python ai_alert_bot.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: Commit and Push Updated SQLite DB
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Stage the database file
+          git add alerts.db
+          
+          # Commit and push only if the database was modified
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update processed alerts database [skip ci]"
+            git push
+          else
+            echo "No database updates to commit."
+          fi
