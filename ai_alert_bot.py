@@ -1,3 +1,4 @@
+import html
 import os
 import sqlite3
 import requests
@@ -14,13 +15,17 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DB_FILE = "alerts.db"
 
+# Ensure environment variables exist before running
+if not all([BOT_TOKEN, CHAT_ID, GEMINI_API_KEY]):
+    raise ValueError("Missing environment variables: Ensure TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, and GEMINI_API_KEY are set.")
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ---------------------------------------------------------------------------
 # Database Layer (SQLite)
 # ---------------------------------------------------------------------------
 def init_db():
-    """ Creates the alerts table if it doesn't already exist."""
+    """Creates the alerts table if it doesn't already exist."""
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -39,7 +44,7 @@ def is_alert_processed(guid: str) -> bool:
         return cursor.fetchone() is not None
 
 def mark_alert_processed(guid: str):
-    """ Saves a processed RSS GUID to the database."""
+    """Saves a processed RSS GUID to the database."""
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR IGNORE INTO processed_alerts (guid) VALUES (?)", (guid,))
@@ -68,20 +73,28 @@ def analyze_threat_with_gemini(raw_text: str) -> SecurityAlertSchema:
     )
     return response.parsed
 
-def build_telegram_message(alert: SecurityAlertSchema, source: str) -> str:
+def build_telegram_message(alert: SecurityAlertSchema, source: str, link: str = None) -> str:
     severity_emojis = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}
     emoji = severity_emojis.get(alert.severity.upper(), "🟡")
+    
+    # Clean up hashtags and sanitize all dynamic values for HTML safety
     tags = " ".join([t if t.startswith("#") else f"#{t}" for t in alert.hashtags])
+    title = html.escape(alert.title)
+    summary = html.escape(alert.summary)
+    action = html.escape(alert.recommended_action)
+
+    # Attach URL hyperlink if provided
+    source_str = f'<a href="{link}">{source}</a>' if link else source
 
     return (
         f"🚨 <b>CYBERSECURITY ALERT</b>\n\n"
         f"{emoji} <b>Severity:</b> {alert.severity.upper()}\n\n"
         f"┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n\n"
-        f"📌 <b>Title:</b>\n{alert.title}\n\n"
-        f"📝 <b>Description:</b>\n{alert.summary}\n\n"
+        f"📌 <b>Title:</b>\n{title}\n\n"
+        f"📝 <b>Description:</b>\n{summary}\n\n"
         f"┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n\n"
-        f"🛡️ <b>Recommended Action:</b>\n{alert.recommended_action}\n\n"
-        f"📰 <b>Source:</b> {source}\n\n"
+        f"🛡️ <b>Recommended Action:</b>\n{action}\n\n"
+        f"📰 <b>Source:</b> {source_str}\n\n"
         f"{tags}"
     )
 
@@ -100,7 +113,7 @@ def send_telegram_alert(text: str):
 # Main Control Flow
 # ---------------------------------------------------------------------------
 def run():
-    init_db()  # Ensure SQLite database is initialized
+    init_db()
     
     feed_url = "https://www.cisa.gov/cybersecurity-advisories/all.xml"
     feed = feedparser.parse(feed_url)
@@ -109,16 +122,15 @@ def run():
         print("No feed entries found.")
         return
 
-    # Iterate through recent items (newest first)
     new_alerts_count = 0
-    for entry in reversed(feed.entries[:5]):  # Process up to 5 entries in chronological order
-        # Unique identifier for RSS item: fallback to link if id missing
+    # Process newest entries (up to 5)
+    for entry in reversed(feed.entries[:5]):
         guid = entry.get("id", entry.get("link"))
+        article_link = entry.get("link")
         
         if not guid:
             continue
 
-        # Check if already sent
         if is_alert_processed(guid):
             print(f"Skipping already processed alert: {guid}")
             continue
@@ -126,11 +138,15 @@ def run():
         print(f"New alert detected: {guid}")
         raw_content = f"Title: {entry.title}\nContent: {entry.get('summary', '')}"
 
-        # 1. Summarise with Gemini
+        # 1. Summarize with Gemini
         parsed_alert = analyze_threat_with_gemini(raw_content)
 
-        # 2. Format message
-        telegram_msg = build_telegram_message(parsed_alert, source="CISA Advisories")
+        # 2. Format message (with HTML escaping and hyperlink)
+        telegram_msg = build_telegram_message(
+            parsed_alert, 
+            source="CISA Advisories", 
+            link=article_link
+        )
 
         # 3. Send to Telegram
         send_telegram_alert(telegram_msg)
